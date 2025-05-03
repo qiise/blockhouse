@@ -1,10 +1,27 @@
+'''
+Smart Order Router Backtest
+Implementation of Cont-Kukanov allocator with parameter tuning and a comparison with three baselines
+'''
 import pandas as pd
 import numpy as np
 import json
 
+
+'''
+DATA PREPROCESSING
+
+Process the raw market data into venue snapshots
+
+Args:
+    file_name (str): Path to the CSV file containing market data
+
+Returns:
+    dict: Snapshots of best ask prices/sizes per venue, keyed by timestamp (ts_event)
+
+'''
 def process_data(file_name):
     df = pd.read_csv(file_name)
-    df = df.sort_values('ts_event')
+    df = df.sort_values('ts_event') #sort by ts_event
     df = df.groupby(['ts_event', 'publisher_id']).first().reset_index()
     snapshot = {}
     for event, group in df.groupby('ts_event'):
@@ -13,14 +30,30 @@ def process_data(file_name):
             venue={
                 'ask_size' : row['ask_sz_00'],
                 'display_size': row['ask_px_00'],
-                'fee' : 0.003,
+                'fee' : 0.003, #use a fixed fee/rebate for simplicity
                 'rebate': 0.002
             }
             venues.append(venue)
         snapshot[event] = venues
     return snapshot
 
+'''
+CONT-KUKANOV ALLOCATOR
 
+Computes optimal order to split across venues using the Cont-Kukanov model
+
+Args:
+    order_size (int): total shares to execute
+    venues (list): list of venue dictionaries
+    lambda_over (float): penalty for overfilling
+    lambda_under (float): penality for underfilling
+    queue_risk (float): queue risk penality coefficient
+
+Returns:
+    tuple (best_split, best_cost):
+        best_split: list of shares to route to each venue
+        best_cost: estimated total cost of allocation
+'''
 def allocate(order_size, venues, lambda_over, lambda_under, queue_risk):
     step = 100
     splits = [[]]
@@ -44,8 +77,20 @@ def allocate(order_size, venues, lambda_over, lambda_under, queue_risk):
             best_cost = cost
             best_split = alloc
     return best_split, best_cost
-
-
+"""
+    Calculate total execution cost for a given order split.
+    
+    Args:
+        split (list): Shares allocated to each venue.
+        venues (list): Venue dictionaries with market data.
+        order_size (int): Target execution size.
+        lambda_o (float): Overfill penalty.
+        lambda_u (float): Underfill penalty.
+        theta (float): Queue risk penalty.
+    
+    Returns:
+        float: Total cost including fees, rebates, and penalties.
+"""
 def compute_cost(split, venues, order_size, lambda_o, lambda_u, theta):
     executed = 0
     cash_spent = 0
@@ -62,17 +107,33 @@ def compute_cost(split, venues, order_size, lambda_o, lambda_u, theta):
     cost_pen = lambda_u * underfill + lambda_o*overfill
     return cash_spent + risk_pen + cost_pen
 
+"""
+BACKTEST
+
+    Simulate order execution over time using the allocator.
+    
+    Args:
+        snapshots (dict): Preprocessed market data.
+        lambda_over (float): Overfill penalty.
+        lambda_under (float): Underfill penalty.
+        queue_risk (float): Queue risk penalty.
+    
+    Returns:
+        tuple: (total_cash, average_price) where:
+               - total_cash: Total money spent.
+               - avg_price: Average execution price (or None if unfilled).
+"""
 def backtest(snapshots, lambda_over, lambda_under, queue_risk):
     snapshots = sorted(snapshots.items())
     remaining = 5000
-    total = 0
+    total_cash = 0
     for event, venues in snapshots:
         if remaining <=0:
             break
-        alloc, _ = allocate(remaining, venues, lambda_over, lambda_under, queue_risk)
+        alloc, _ = allocate(remaining, venues, lambda_over, lambda_under, queue_risk) #Determine splits at each timestamp
         executed = 0
         cash = 0
-        for i in range(0, len(venues)):
+        for i in range(0, len(venues)): #identify the best performing set
             exe = min(alloc[i], venues[i]['ask_size'])
             cash += exe*(venues[i]['display_size'] + venues[i]['fee'])
             cash -= max(alloc[i] - exe, 0)* venues[i]['rebate']
@@ -84,11 +145,16 @@ def backtest(snapshots, lambda_over, lambda_under, queue_risk):
     else:
         average_price = None
     return total_cash, average_price
-#best ask
+
+#-------------------------------
+# BASELINE STRATEGIES
+#-------------------------------
+
+#best ask strategy
 def baseline1(snapshots):
     snapshots = sorted(snapshots.items())
     remaining = 5000
-    total_cast = 0
+    total_cash = 0
     for event, venues in snapshots:
         if remaining <=0:
             break
@@ -99,7 +165,7 @@ def baseline1(snapshots):
     average_price = total_cash/5000
     return total_cash, average_price
 
-#twap
+#twap baseline strategy
 def baseline2(snapshots):
     snapshots = sorted(snapshots.items())
     total_time = 540
@@ -130,7 +196,7 @@ def baseline2(snapshots):
     avg_price = total_cash/5000
     return total_cash, avg_price
 
-#vwap
+#vwap baseline strategy
 def baseline3(snapshots):
     snapshots = sorted(snapshots.items())
     remaining = 5000
@@ -157,8 +223,11 @@ def baseline3(snapshots):
     return total_cash, average_price
 
 
+#-------------------------------
+# MAIN
+#-------------------------------
 
-#run
+
 def main():
     snapshots = process_data('LL_day.csv')
 
@@ -167,7 +236,7 @@ def main():
     lambda_under = [0.01, 0.05, 0.1]
     queue_risk = [0.0, 0.001, 0.005]
 
-
+    #grid search to find optimal parameters
     best_cost = float('inf')
     best_params = {}
 
@@ -194,7 +263,7 @@ def main():
     cash3, avg3 = baseline3(snapshots)
 
 
-    #calculating savings of my method vs baseline in basis points
+    #calculating savings of my method vs baseline in basis points (bp = 0.01%)
 
     savings1 = (avg1 - best_params['avg_price'])/avg1 * 10000 if avg1 != 0 else 0
     savings2 = (avg2 - best_params['avg_price'])/avg2 * 10000 if avg2 != 0 else 0
